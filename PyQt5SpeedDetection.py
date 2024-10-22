@@ -1,6 +1,7 @@
 import sys
 import cv2
 import numpy as np
+import math
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QVBoxLayout, QWidget
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QTimer
@@ -10,7 +11,7 @@ from ultralytics import YOLO
 FOCAL_LENGTH = 800  # Example value, should be calibrated for the camera
 REAL_CAR_HEIGHT = 1.5  # Approximate average height of a car in meters
 
-# Dehazing and enhancement functions (same as before)
+# Dehazing and enhancement functions
 def dark_channel(image, size=15):
     dark_channel_img = np.min(image, axis=2)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
@@ -60,9 +61,7 @@ class VideoApp(QMainWindow):
         self.model = YOLO("yolo-Weights/yolov8n.pt")
         self.cap = None
         self.output_frame = None
-        self.trackers = []  # List to store object trackers
-        self.car_ids = 0
-        self.object_info = {}  # Dictionary to store distances and speeds
+        self.previous_centroids = {}  # To track previous car positions for speed estimation
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -117,6 +116,7 @@ class VideoApp(QMainWindow):
 
         # YOLOv8 detection
         results = self.model(dehazed_img, stream=True)
+        current_centroids = {}
         for r in results:
             boxes = r.boxes
             for box in boxes:
@@ -124,46 +124,30 @@ class VideoApp(QMainWindow):
                 pixel_height = y2 - y1
                 # Estimate distance
                 distance = (FOCAL_LENGTH * REAL_CAR_HEIGHT) / pixel_height
+                # Calculate centroid
+                centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
+                current_centroids[centroid] = distance
 
-                # Create a new tracker for each detected object
-                tracker = cv2.TrackerCSRT_create()
-                bbox = (x1, y1, x2 - x1, y2 - y1)
-                tracker.init(dehazed_img, bbox)
-                self.trackers.append(tracker)
+                # Speed estimation
+                speed = self.estimate_speed(centroid, distance)
 
-                # Assign ID to the car and store initial distance and time
-                car_id = self.car_ids
-                self.car_ids += 1
-                self.object_info[car_id] = {"distance": distance, "prev_distance": distance, "speed": 0}
-
-                # Draw bounding boxes and distance info
+                # Draw detection boxes and info
                 cv2.rectangle(dehazed_img, (x1, y1), (x2, y2), (255, 0, 255), 2)
                 cv2.putText(dehazed_img, f"Dist: {distance:.2f}m", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(dehazed_img, f"Speed: {speed:.2f}m/s", (x1, y2 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # Update trackers and estimate speed
-        self.update_trackers(dehazed_img)
+        self.previous_centroids = current_centroids
         return dehazed_img
 
-    def update_trackers(self, frame):
-        for i, tracker in enumerate(self.trackers):
-            success, bbox = tracker.update(frame)
-            if success:
-                x, y, w, h = map(int, bbox)
-                pixel_height = h
-                distance = (FOCAL_LENGTH * REAL_CAR_HEIGHT) / pixel_height
-
-                # Calculate speed
-                car_id = i
-                prev_distance = self.object_info[car_id]["prev_distance"]
-                speed = abs(distance - prev_distance) / (1 / 30.0)  # Assuming 30 FPS
-
-                # Update object info
-                self.object_info[car_id]["prev_distance"] = distance
-                self.object_info[car_id]["speed"] = speed
-
-                # Draw bounding boxes, speed, and distance info
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(frame, f"Speed: {speed:.2f}m/s", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    def estimate_speed(self, centroid, distance):
+        # Estimate speed using the displacement of the centroid and the frame rate
+        if centroid in self.previous_centroids:
+            prev_distance = self.previous_centroids[centroid]
+            displacement = abs(distance - prev_distance)
+            time_interval = 1 / 30.0  # Assuming 30 FPS
+            speed = displacement / time_interval
+            return speed
+        return 0
 
     def display_frame(self, label, frame):
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
