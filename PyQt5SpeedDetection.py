@@ -7,9 +7,8 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QTimer
 from ultralytics import YOLO
 
-# Constants for distance estimation
-FOCAL_LENGTH = 800  # Example value, should be calibrated for the camera
-REAL_CAR_HEIGHT = 1.5  # Approximate average height of a car in meters
+FOCAL_LENGTH = 800
+REAL_CAR_HEIGHT = 1.5
 
 # Dehazing and enhancement functions
 def dark_channel(image, size=15):
@@ -61,7 +60,7 @@ class VideoApp(QMainWindow):
         self.model = YOLO("yolo-Weights/yolov8n.pt")
         self.cap = None
         self.output_frame = None
-        self.previous_centroids = {}  # To track previous car positions for speed estimation
+        self.previous_centroids = {}
 
     def initUI(self):
         layout = QVBoxLayout()
