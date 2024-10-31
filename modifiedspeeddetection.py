@@ -1,13 +1,17 @@
 import sys
 import cv2
 import numpy as np
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QVBoxLayout, QWidget, QHBoxLayout
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QVBoxLayout, QWidget, \
+    QHBoxLayout
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QTimer, Qt
 from ultralytics import YOLO
+import torch
+from deep_sort_realtime.deepsort_tracker import DeepSort
 
 FOCAL_LENGTH = 800
 REAL_CAR_HEIGHT = 1.5
+
 
 # Dehazing and enhancement functions
 def dark_channel(image, size=7):
@@ -15,6 +19,7 @@ def dark_channel(image, size=7):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
     dark_channel_img = cv2.erode(dark_channel_img, kernel)
     return dark_channel_img
+
 
 def estimate_atmospheric_light(image, dark_channel_img, top_percent=0.001):
     num_pixels = image.shape[0] * image.shape[1]
@@ -25,23 +30,27 @@ def estimate_atmospheric_light(image, dark_channel_img, top_percent=0.001):
     atmospheric_light = np.percentile(brightest_pixels, 90, axis=0)
     return atmospheric_light
 
+
 def estimate_transmission(image, atmospheric_light, omega=0.95, size=7):
     norm_image = image / atmospheric_light
     transmission = 1 - omega * dark_channel(norm_image, size)
     return np.clip(transmission, 0.1, 1)
+
 
 def recover_radiance(image, transmission, atmospheric_light, t0=0.1):
     transmission = np.expand_dims(transmission, axis=2)
     radiance = (image - atmospheric_light) / np.maximum(transmission, t0) + atmospheric_light
     return np.clip(radiance, 0, 1)
 
-def apply_clahe(image, clip_limit=1.0, tile_grid_size=(4, 4)):
+
+def apply_clahe(image, clip_limit=2.0, tile_grid_size=(8, 8)):
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
     l_clahe = clahe.apply(l)
     lab_clahe = cv2.merge((l_clahe, a, b))
     return cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+
 
 class VideoApp(QMainWindow):
     def __init__(self):
@@ -59,9 +68,27 @@ class VideoApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.initUI()
-        self.model = YOLO("yolo-Weights/yolov8n.pt")
+
+        # Initialize YOLO
+        self.model = YOLO("yolov8n.pt")
+
+        # Initialize DeepSORT - no weights needed for deep_sort_realtime
+        self.tracker = DeepSort(
+            max_age=30,
+            n_init=3,
+            nms_max_overlap=1.0,
+            max_cosine_distance=0.3,
+            nn_budget=None,
+            override_track_class=None,
+            embedder="mobilenet",
+            half=True,
+            bgr=True,
+            embedder_gpu=True
+        )
+
         self.cap = None
-        self.previous_centroids = {}
+        self.track_history = {}
+        self.last_process_time = {}
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -125,6 +152,96 @@ class VideoApp(QMainWindow):
         self.uploadButton.setEnabled(True)
         self.stopButton.setEnabled(False)
 
+    def calculate_speed(self, track_id, bbox, distance, current_time):
+        if track_id in self.track_history and track_id in self.last_process_time:
+            prev_bbox, prev_distance = self.track_history[track_id]
+            time_diff = current_time - self.last_process_time[track_id]
+
+            if time_diff > 0:
+                # Calculate center points
+                current_center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+                prev_center = ((prev_bbox[0] + prev_bbox[2]) / 2, (prev_bbox[1] + prev_bbox[3]) / 2)
+
+                # Calculate displacement in pixels and real-world distance
+                pixel_displacement = np.sqrt(
+                    (current_center[0] - prev_center[0]) ** 2 +
+                    (current_center[1] - prev_center[1]) ** 2
+                )
+
+                depth_displacement = abs(distance - prev_distance)
+
+                # Convert pixel displacement to meters using average distance
+                avg_distance = (distance + prev_distance) / 2
+                real_displacement = (pixel_displacement * avg_distance) / FOCAL_LENGTH
+
+                # Calculate 3D displacement
+                total_displacement = np.sqrt(real_displacement ** 2 + depth_displacement ** 2)
+
+                # Calculate speed in km/h
+                speed = (total_displacement / time_diff) * 3.6  # Convert m/s to km/h
+                return min(speed, 150)  # Cap speed at 150 km/h to filter outliers
+
+        return 0
+
+    def process_frame(self, frame):
+        current_time = cv2.getTickCount() / cv2.getTickFrequency()
+
+        # Dehaze and enhance
+        img = frame.astype(np.float32) / 255.0
+        dark_channel_img = dark_channel(img)
+        atmospheric_light = estimate_atmospheric_light(img, dark_channel_img)
+        transmission = estimate_transmission(img, atmospheric_light)
+        dehazed_img = recover_radiance(img, transmission, atmospheric_light)
+        dehazed_img = (dehazed_img * 255).astype(np.uint8)
+        enhanced_img = apply_clahe(dehazed_img)
+
+        # Run YOLO detection
+        results = self.model(enhanced_img, stream=True)
+        detections = []
+
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                if cls == 2:  # Class 2 is car in COCO dataset
+                    detections.append(((x1, y1, x2, y2), conf, cls))
+
+        # Update DeepSORT tracker
+        tracks = self.tracker.update_tracks(detections, frame=enhanced_img)
+
+        # Process and draw each track
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+
+            track_id = track.track_id
+            bbox = track.to_tlbr()  # Gets (top, left, bottom, right)
+            x1, y1, x2, y2 = map(int, bbox)
+
+            # Calculate distance using height
+            height = y2 - y1
+            distance = (FOCAL_LENGTH * REAL_CAR_HEIGHT) / height
+
+            # Calculate speed
+            speed = self.calculate_speed(track_id, bbox, distance, current_time)
+
+            # Update tracking history
+            self.track_history[track_id] = (bbox, distance)
+            self.last_process_time[track_id] = current_time
+
+            # Draw bounding box and information
+            cv2.rectangle(enhanced_img, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            cv2.putText(enhanced_img, f"ID: {track_id}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(enhanced_img, f"Dist: {distance:.2f}m", (x1, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(enhanced_img, f"Speed: {speed:.1f}km/h", (x1, y2 + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        return enhanced_img
+
     def update_frame(self):
         if self.cap is None or not self.cap.isOpened():
             self.timer.stop()
@@ -140,57 +257,17 @@ class VideoApp(QMainWindow):
         self.display_frame(self.originalLabel, original_frame)
         self.display_frame(self.processedLabel, processed_frame)
 
-    def process_frame(self, frame):
-        img = frame.astype(np.float32) / 255.0
-        dark_channel_img = dark_channel(img)
-        atmospheric_light = estimate_atmospheric_light(img, dark_channel_img)
-        transmission = estimate_transmission(img, atmospheric_light)
-        dehazed_img = recover_radiance(img, transmission, atmospheric_light)
-        dehazed_img = (dehazed_img * 255).astype(np.uint8)
-        dehazed_img = apply_clahe(dehazed_img)
-
-        results = self.model(dehazed_img, stream=True)
-        current_centroids = {}
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                pixel_height = y2 - y1
-                distance = (FOCAL_LENGTH * REAL_CAR_HEIGHT) / pixel_height
-                centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
-                current_centroids[centroid] = distance
-                speed = self.estimate_speed(centroid, distance)
-
-                cv2.rectangle(dehazed_img, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                cv2.putText(dehazed_img, f"Dist: {distance:.2f}m", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 255, 0), 2)
-                cv2.putText(dehazed_img, f"Speed: {speed:.2f}m/s", (x1, y2 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 255, 0), 2)
-
-        self.previous_centroids = current_centroids
-        return dehazed_img
-
-    def estimate_speed(self, centroid, distance):
-        if centroid in self.previous_centroids:
-            prev_distance = self.previous_centroids[centroid]
-            displacement = abs(distance - prev_distance)
-            time_interval = 1 / 30.0
-            speed = displacement / time_interval
-            return speed
-        return 0
-
     def display_frame(self, label, frame):
-        # Convert BGR to RGB
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Create QImage from the RGB image
-        qimage = QImage(rgb_image.data, rgb_image.shape[1], rgb_image.shape[0],
-                        rgb_image.strides[0], QImage.Format_RGB888)
-        # Update the label with the QPixmap
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qimage = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
         label.setPixmap(QPixmap.fromImage(qimage))
 
     def closeEvent(self, event):
         self.stop_processing()
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
