@@ -6,7 +6,6 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFil
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QTimer, Qt
 from ultralytics import YOLO
-import torch
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 FOCAL_LENGTH = 800
@@ -43,7 +42,7 @@ def recover_radiance(image, transmission, atmospheric_light, t0=0.1):
     return np.clip(radiance, 0, 1)
 
 
-def apply_clahe(image, clip_limit=2.0, tile_grid_size=(8, 8)):
+def apply_clahe(image, clip_limit=3.0, tile_grid_size=(10, 10)):
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
