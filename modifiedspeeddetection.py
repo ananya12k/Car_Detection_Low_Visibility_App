@@ -75,7 +75,7 @@ class VideoApp(QMainWindow):
         self.tracker = DeepSort(
             max_age=30,
             n_init=3,
-            nms_max_overlap=1.0,
+            nms_max_overlap=0.7,
             max_cosine_distance=0.3,
             nn_budget=None,
             override_track_class=None,
@@ -205,6 +205,16 @@ class VideoApp(QMainWindow):
                 conf = float(box.conf[0])
                 cls = int(box.cls[0])
                 if cls == 2:  # Class 2 is car in COCO dataset
+                    # Make bounding box tighter by slightly shrinking the coordinates
+                    margin = 0.30  # Shrinking margin (5% of box dimensions)
+                    width = x2 - x1
+                    height = y2 - y1
+
+                    x1 = max(0, x1 + int(margin * width))
+                    y1 = max(0, y1 + int(margin * height))
+                    x2 = min(frame.shape[1], x2 - int(margin * width))
+                    y2 = min(frame.shape[0], y2 - int(margin * height))
+
                     detections.append(((x1, y1, x2, y2), conf, cls))
 
         # Update DeepSORT tracker
@@ -240,6 +250,7 @@ class VideoApp(QMainWindow):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         return enhanced_img
+
 
     def update_frame(self):
         if self.cap is None or not self.cap.isOpened():
